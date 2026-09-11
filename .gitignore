@@ -1,0 +1,29 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables / secrets
+.env
+
+# Local databases
+*.db
+
+# Qdrant local storage
+qdrant_data/
+
+# Audit logs
+audit_log/*.jsonl
+
+# Testing / tooling cache
+.pytest_cache/
+.mypy_cache/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
