@@ -1,1 +1,2 @@
 # AuditAgent dependencies will be added incrementally.
+streamlit==1.63.0
