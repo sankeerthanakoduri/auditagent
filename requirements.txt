@@ -1,2 +1,8 @@
-# AuditAgent dependencies will be added incrementally.
 streamlit==1.63.0
+langchain==1.4.0
+langchain-community
+langchain-text-splitters==1.1.2
+langgraph==1.2.11
+python-dotenv==1.2.3
+pydantic
+qdrant-client==1.19.0
