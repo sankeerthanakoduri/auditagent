@@ -1,26 +1,26 @@
-from typing import Any
+from retrieval.models import DocumentChunk
+from audit_log.logger import AuditLogger
 
 
-def is_authorized(user_role: str, document: dict[str, Any]) -> bool:
+def is_authorized(user_role: str, document: DocumentChunk) -> bool:
     """
-    Check whether a user's role is allowed to access a document/chunk.
+    Check whether a user's role is allowed to access a document chunk.
     """
 
-    allowed_roles = document.get("allowed_roles", [])
-
-    return user_role in allowed_roles
+    return user_role in document.allowed_roles
 
 
 def filter_authorized_documents(
     user_role: str,
-    documents: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    documents: list[DocumentChunk],
+    query: str,
+    audit_logger: AuditLogger | None = None,
+) -> tuple[list[DocumentChunk], list[DocumentChunk]]:
     """
-    Split documents into authorized and blocked results.
+    Split document chunks into authorized and blocked results.
 
-    Returns:
-        authorized_documents
-        blocked_documents
+    Unauthorized documents are never returned in the authorized list.
+    Optionally records each blocked retrieval in the audit log.
     """
 
     authorized = []
@@ -29,7 +29,26 @@ def filter_authorized_documents(
     for document in documents:
         if is_authorized(user_role, document):
             authorized.append(document)
+
+            if audit_logger:
+                audit_logger.log_event(
+                    event_type="retrieval",
+                    user_role=user_role,
+                    query=query,
+                    document_id=document.id,
+                    allowed=True,
+                )
+
         else:
             blocked.append(document)
+
+            if audit_logger:
+                audit_logger.log_event(
+                    event_type="acl_block",
+                    user_role=user_role,
+                    query=query,
+                    document_id=document.id,
+                    allowed=False,
+                )
 
     return authorized, blocked
