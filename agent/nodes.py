@@ -54,6 +54,7 @@ def get_llm():
         model="openai/gpt-oss-120b",
         temperature=0,
         api_key=api_key,
+        service_tier="auto",
     )
 
 

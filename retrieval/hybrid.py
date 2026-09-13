@@ -1,16 +1,25 @@
+import os
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
 from fastembed import TextEmbedding
-from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchAny
 from rank_bm25 import BM25Okapi
 
 from retrieval.models import DocumentChunk
+from retrieval.qdrant_store import (
+    COLLECTION_NAME,
+    get_qdrant_client,
+)
 from retrieval.reranker import DocumentReranker
 
 
-QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "auditagent_docs"
+load_dotenv()
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
@@ -19,20 +28,28 @@ BM25_LIMIT = 5
 FINAL_LIMIT = 3
 
 
+# ============================================================
+# Retrieval result
+# ============================================================
+
 @dataclass
 class RetrievalResult:
-    """Final retrieval result."""
+    """Final retrieval result returned to the application."""
 
     document: DocumentChunk
     score: float
 
 
+# ============================================================
+# Hybrid Retriever
+# ============================================================
+
 class HybridRetriever:
     """
-    Hybrid retrieval using:
+    Hybrid retrieval system using:
 
-    1. Qdrant dense retrieval
-    2. BM25 lexical retrieval
+    1. Dense vector search through Qdrant
+    2. BM25 lexical search
     3. Retrieval-time ACL filtering
     4. Reciprocal Rank Fusion
     5. BGE cross-encoder reranking
@@ -40,9 +57,7 @@ class HybridRetriever:
 
     def __init__(self):
 
-        self.qdrant = QdrantClient(
-            url=QDRANT_URL
-        )
+        self.qdrant = get_qdrant_client()
 
         self.embedding_model = TextEmbedding(
             EMBEDDING_MODEL
@@ -56,55 +71,83 @@ class HybridRetriever:
 
         self.bm25 = self._build_bm25_index()
 
+
+    # ========================================================
+    # Load documents from Qdrant
+    # ========================================================
+
     def _load_documents_from_qdrant(
         self,
     ) -> list[DocumentChunk]:
 
-        records, _ = self.qdrant.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=1000,
-            with_payload=True,
-            with_vectors=False,
-        )
-
         documents = []
 
-        for record in records:
+        offset = None
 
-            payload = record.payload or {}
+        while True:
 
-            metadata = payload.get(
-                "metadata",
-                {},
+            records, next_offset = (
+                self.qdrant.scroll(
+                    collection_name=COLLECTION_NAME,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
             )
 
-            document = DocumentChunk(
-                id=metadata.get(
-                    "chunk_id",
-                    str(record.id),
-                ),
-                text=payload.get(
-                    "text",
-                    "",
-                ),
-                source=payload.get(
-                    "source",
-                    "",
-                ),
-                allowed_roles=payload.get(
-                    "allowed_roles",
-                    [],
-                ),
-                metadata=metadata,
-            )
+            for record in records:
 
-            documents.append(document)
+                payload = record.payload or {}
+
+                metadata = payload.get(
+                    "metadata",
+                    {},
+                )
+
+                document = DocumentChunk(
+                    id=metadata.get(
+                        "chunk_id",
+                        str(record.id),
+                    ),
+                    text=payload.get(
+                        "text",
+                        "",
+                    ),
+                    source=payload.get(
+                        "source",
+                        "",
+                    ),
+                    allowed_roles=payload.get(
+                        "allowed_roles",
+                        [],
+                    ),
+                    metadata=metadata,
+                )
+
+                documents.append(document)
+
+            if next_offset is None:
+                break
+
+            offset = next_offset
 
         return documents
+
+
+    # ========================================================
+    # BM25
+    # ========================================================
 
     def _build_bm25_index(
         self,
     ) -> BM25Okapi:
+
+        if not self.documents:
+
+            return BM25Okapi(
+                [["__empty__"]]
+            )
 
         tokenized_documents = [
             document.text.lower().split()
@@ -115,21 +158,30 @@ class HybridRetriever:
             tokenized_documents
         )
 
+
+    # ========================================================
+    # Dense Retrieval
+    # ========================================================
+
     def _dense_search(
         self,
         query: str,
         user_role: str,
     ) -> list[DocumentChunk]:
-        """
-        Perform semantic search with ACL filtering
-        directly in Qdrant.
-        """
+
+        if not self.documents:
+            return []
 
         query_vector = list(
             self.embedding_model.embed(
                 [query]
             )
         )[0]
+
+        # Retrieval-time ACL filter.
+        #
+        # Unauthorized chunks are filtered inside
+        # Qdrant before they are returned.
 
         acl_filter = Filter(
             must=[
@@ -186,16 +238,23 @@ class HybridRetriever:
 
         return documents
 
+
+    # ========================================================
+    # BM25 Retrieval
+    # ========================================================
+
     def _bm25_search(
         self,
         query: str,
         user_role: str,
     ) -> list[DocumentChunk]:
-        """
-        Perform BM25 search only over authorized documents.
-        """
 
-        query_tokens = query.lower().split()
+        if not self.documents:
+            return []
+
+        query_tokens = (
+            query.lower().split()
+        )
 
         scores = self.bm25.get_scores(
             query_tokens
@@ -203,10 +262,10 @@ class HybridRetriever:
 
         authorized_indices = [
             index
-            for index, document in enumerate(
-                self.documents
-            )
-            if user_role in document.allowed_roles
+            for index, document
+            in enumerate(self.documents)
+            if user_role
+            in document.allowed_roles
         ]
 
         ranked_indices = sorted(
@@ -217,8 +276,14 @@ class HybridRetriever:
 
         return [
             self.documents[index]
-            for index in ranked_indices[:BM25_LIMIT]
+            for index
+            in ranked_indices[:BM25_LIMIT]
         ]
+
+
+    # ========================================================
+    # Reciprocal Rank Fusion
+    # ========================================================
 
     @staticmethod
     def _reciprocal_rank_fusion(
@@ -226,12 +291,11 @@ class HybridRetriever:
         bm25_results: list[DocumentChunk],
         k: int = 60,
     ) -> list[DocumentChunk]:
-        """
-        Combine dense and BM25 rankings using RRF.
-        """
 
         scores = {}
         documents = {}
+
+        # Dense ranking
 
         for rank, document in enumerate(
             dense_results,
@@ -248,7 +312,11 @@ class HybridRetriever:
                 + 1 / (k + rank)
             )
 
-            documents[document_id] = document
+            documents[document_id] = (
+                document
+            )
+
+        # BM25 ranking
 
         for rank, document in enumerate(
             bm25_results,
@@ -265,7 +333,9 @@ class HybridRetriever:
                 + 1 / (k + rank)
             )
 
-            documents[document_id] = document
+            documents[document_id] = (
+                document
+            )
 
         ranked_ids = sorted(
             scores,
@@ -281,13 +351,18 @@ class HybridRetriever:
                 document_id
             ]
 
-            document.score = scores[
-                document_id
-            ]
+            document.score = (
+                scores[document_id]
+            )
 
             results.append(document)
 
         return results
+
+
+    # ========================================================
+    # Final Search
+    # ========================================================
 
     def search(
         self,
@@ -295,28 +370,19 @@ class HybridRetriever:
         user_role: str,
         limit: int = FINAL_LIMIT,
     ) -> list[RetrievalResult]:
-        """
-        Complete retrieval pipeline:
 
-        Dense + ACL
-             +
-        BM25 + ACL
-             ↓
-        RRF
-             ↓
-        BGE Reranker
-             ↓
-        Final authorized evidence
-        """
-
-        dense_results = self._dense_search(
-            query=query,
-            user_role=user_role,
+        dense_results = (
+            self._dense_search(
+                query=query,
+                user_role=user_role,
+            )
         )
 
-        bm25_results = self._bm25_search(
-            query=query,
-            user_role=user_role,
+        bm25_results = (
+            self._bm25_search(
+                query=query,
+                user_role=user_role,
+            )
         )
 
         fused_results = (
@@ -325,6 +391,9 @@ class HybridRetriever:
                 bm25_results=bm25_results,
             )
         )
+
+        if not fused_results:
+            return []
 
         reranked_documents = (
             self.reranker.rerank(
@@ -339,9 +408,14 @@ class HybridRetriever:
                 document=document,
                 score=document.score or 0.0,
             )
-            for document in reranked_documents
+            for document
+            in reranked_documents
         ]
 
+
+# ============================================================
+# Manual test
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -393,8 +467,7 @@ if __name__ == "__main__":
         )
 
         print(
-            f"Reranker score: "
-            f"{result.score:.4f}"
+            f"Score: {result.score:.4f}"
         )
 
         print(
@@ -408,4 +481,5 @@ if __name__ == "__main__":
         )
 
     print()
+
     print("=" * 60)
