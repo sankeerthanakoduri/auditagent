@@ -1,0 +1,16 @@
+Human Resources Report
+
+Document Classification: Restricted
+Department: HR
+Authorized Roles: hr, admin
+
+Employee Benefits Summary
+
+The company provides medical insurance, paid leave, and retirement benefits
+to eligible employees.
+
+The standard annual leave entitlement is 24 days.
+Employees can request additional unpaid leave subject to manager approval.
+
+This document contains HR-related information and should only be accessible
+to authorized HR personnel and administrators.

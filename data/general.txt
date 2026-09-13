@@ -1,0 +1,13 @@
+Company Information
+
+Document Classification: Internal
+Department: General
+Authorized Roles: finance, hr, employee, admin
+
+The company operates across multiple business units in India.
+
+Employees are expected to follow the company's information security,
+acceptable-use, and data protection policies.
+
+This document contains general company information that can be accessed
+by employees with valid internal access.

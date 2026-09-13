@@ -1,198 +1,678 @@
 import os
-from typing import Any
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 
-from retrieval.hybrid import HybridRetriever
+from audit_log.logger import AuditLogger
 
 from agent.prompts import (
-    PLANNER_PROMPT,
     CRITIC_PROMPT,
+    PLANNER_PROMPT,
+    REFORMULATOR_PROMPT,
+    SQL_PROMPT,
     SYNTHESIZER_PROMPT,
     VERIFIER_PROMPT,
+    WEB_SYNTHESIS_PROMPT,
 )
+
+from agent.sql_tool import SQLTool
+from agent.web_tool import WebTool
+from retrieval.hybrid import HybridRetriever
 
 
 load_dotenv()
 
 
-class AuditAgentNodes:
+MAX_RETRIEVAL_ATTEMPTS = 2
+
+
+# ============================================================
+# AUDIT LOGGER
+# ============================================================
+
+audit_logger = AuditLogger()
+
+
+# ============================================================
+# LLM
+# ============================================================
+
+def get_llm():
+
+    api_key = os.getenv(
+        "GROQ_API_KEY"
+    )
+
+    if not api_key:
+
+        raise RuntimeError(
+            "GROQ_API_KEY is not configured. "
+            "Add it to the .env file."
+        )
+
+    return ChatGroq(
+        model="openai/gpt-oss-120b",
+        temperature=0,
+        api_key=api_key,
+    )
+
+
+def clean_llm_output(content) -> str:
+
+    if isinstance(content, str):
+        return content.strip()
+
+    return str(content).strip()
+
+
+# ============================================================
+# PLANNER
+# ============================================================
+
+def planner(state):
+
+    llm = get_llm()
+
+    prompt = PLANNER_PROMPT.format(
+        question=state["question"]
+    )
+
+    response = llm.invoke(prompt)
+
+    route = clean_llm_output(
+        response.content
+    ).lower()
+
+    if route not in {
+        "document",
+        "sql",
+        "web",
+    }:
+
+        route = "document"
+
+    # --------------------------------------------------------
+    # AUDIT EVENT
+    # --------------------------------------------------------
+
+    audit_logger.log_event(
+        event_type="route_selected",
+        user_role=state["user_role"],
+        query=state["question"],
+        metadata={
+            "route": route,
+        },
+    )
+
+    return {
+        "route": route,
+        "search_query": state["question"],
+    }
+
+
+# ============================================================
+# DOCUMENT RETRIEVAL
+# ============================================================
+
+def retrieve(state):
+
+    retriever = HybridRetriever()
+
+    query = (
+        state.get("search_query")
+        or state["question"]
+    )
+
+    documents = retriever.search(
+        query=query,
+        user_role=state["user_role"],
+    )
+
+    return {
+        "documents": documents,
+    }
+
+
+# ============================================================
+# SQL QUERY
+# ============================================================
+
+def sql_query(state):
+
+    llm = get_llm()
+
+    sql_tool = SQLTool()
+
+    schema = sql_tool.get_schema()
+
+    prompt = SQL_PROMPT.format(
+        schema=schema,
+        question=state["question"],
+    )
+
+    response = llm.invoke(prompt)
+
+    generated_sql = clean_llm_output(
+        response.content
+    )
+
+    generated_sql = (
+        generated_sql
+        .replace("```sql", "")
+        .replace("```", "")
+        .strip()
+    )
+
+    try:
+
+        results = sql_tool.execute(
+            generated_sql
+        )
+
+        return {
+            "sql_query": generated_sql,
+            "sql_results": results,
+            "sql_error": None,
+        }
+
+    except Exception as exc:
+
+        return {
+            "sql_query": generated_sql,
+            "sql_results": [],
+            "sql_error": str(exc),
+        }
+
+
+# ============================================================
+# WEB SEARCH
+# ============================================================
+
+def web_search(state):
+
+    web_tool = WebTool()
+
+    query = (
+        state.get("search_query")
+        or state["question"]
+    )
+
+    try:
+
+        results = web_tool.search(
+            query=query,
+            max_results=5,
+        )
+
+        return {
+            "web_results": results,
+            "web_error": None,
+        }
+
+    except Exception as exc:
+
+        return {
+            "web_results": [],
+            "web_error": str(exc),
+        }
+
+
+# ============================================================
+# DOCUMENT → TEXT
+# ============================================================
+
+def document_to_text(document):
     """
-    Node implementations used by the AuditAgent LangGraph workflow.
+    Convert the RetrievalResult returned by HybridRetriever
+    into readable evidence for the LLM.
     """
 
-    def __init__(self):
-        groq_api_key = os.getenv("GROQ_API_KEY")
+    underlying = getattr(
+        document,
+        "document",
+        None,
+    )
 
-        if not groq_api_key:
-            raise RuntimeError(
-                "GROQ_API_KEY was not found. "
-                "Make sure it is present in the project's .env file."
+    if underlying is None:
+
+        underlying = getattr(
+            document,
+            "chunk",
+            None,
+        )
+
+    if underlying is None:
+
+        underlying = document
+
+    text = getattr(
+        underlying,
+        "text",
+        None,
+    )
+
+    if text is None:
+
+        text = getattr(
+            document,
+            "text",
+            None,
+        )
+
+    source = getattr(
+        underlying,
+        "source",
+        None,
+    )
+
+    if source is None:
+
+        source = getattr(
+            document,
+            "source",
+            None,
+        )
+
+    if source is None:
+
+        metadata = getattr(
+            underlying,
+            "metadata",
+            {},
+        )
+
+        source = metadata.get(
+            "source",
+            "unknown",
+        )
+
+    if text is None:
+
+        text = str(underlying)
+
+    score = getattr(
+        document,
+        "score",
+        None,
+    )
+
+    if score is not None:
+
+        return (
+            f"Source: {source}\n"
+            f"Retrieval score: {score}\n"
+            f"Content:\n{text}"
+        )
+
+    return (
+        f"Source: {source}\n"
+        f"Content:\n{text}"
+    )
+
+
+# ============================================================
+# BUILD EVIDENCE
+# ============================================================
+
+def build_evidence(state):
+
+    route = state.get("route")
+
+    # ========================================================
+    # SQL
+    # ========================================================
+
+    if route == "sql":
+
+        sql_results = state.get(
+            "sql_results",
+            [],
+        )
+
+        sql_error = state.get(
+            "sql_error"
+        )
+
+        if sql_error:
+
+            return (
+                "SQL execution error:\n"
+                f"{sql_error}"
             )
 
-        self.llm = ChatGroq(
-            model="openai/gpt-oss-120b",
-            temperature=0,
-            api_key=groq_api_key,
+        if not sql_results:
+
+            return (
+                "SQL query returned no rows."
+            )
+
+        return (
+            f"SQL query:\n"
+            f"{state.get('sql_query', '')}\n\n"
+            f"SQL results:\n"
+            f"{sql_results}"
         )
 
-        self.retriever = HybridRetriever()
+    # ========================================================
+    # WEB
+    # ========================================================
 
-    def planner(self, state: dict[str, Any]) -> dict[str, Any]:
-        """
-        Determine which data source should handle the question.
-        """
+    if route == "web":
 
-        question = state["question"]
-
-        prompt = PLANNER_PROMPT.format(
-            question=question
+        web_results = state.get(
+            "web_results",
+            [],
         )
 
-        response = self.llm.invoke(prompt)
+        if not web_results:
 
-        route = response.content.strip().lower()
+            error = state.get(
+                "web_error"
+            )
 
-        if route != "document":
-            route = "document"
+            if error:
 
-        return {
-            "route": route
-        }
+                return (
+                    "Web search error:\n"
+                    f"{error}"
+                )
 
-    def retrieve(self, state: dict[str, Any]) -> dict[str, Any]:
-        """
-        Retrieve documents using the existing secure hybrid retriever.
-        """
+            return (
+                "Web search returned no results."
+            )
 
-        question = state["question"]
-        user_role = state["user_role"]
+        evidence_parts = []
 
-        documents = self.retriever.search(
-            query=question,
-            user_role=user_role,
+        for index, result in enumerate(
+            web_results,
+            start=1,
+        ):
+
+            evidence_parts.append(
+                f"Result {index}\n"
+                f"Title: {result.title}\n"
+                f"URL: {result.url}\n"
+                f"Snippet: {result.snippet}"
+            )
+
+        return "\n\n".join(
+            evidence_parts
         )
 
-        return {
-            "documents": documents
-        }
+    # ========================================================
+    # DOCUMENT
+    # ========================================================
 
-    def critic(self, state: dict[str, Any]) -> dict[str, Any]:
-        """
-        Determine whether retrieved evidence is sufficient.
-        """
+    documents = state.get(
+        "documents",
+        [],
+    )
 
-        question = state["question"]
-        documents = state.get("documents", [])
+    if not documents:
 
-        evidence = "\n\n".join(
-            document.document.text
-            for document in documents
+        return (
+            "No authorized documents "
+            "were retrieved."
         )
 
-        if not evidence:
-            return {
-                "critique": "INSUFFICIENT"
-            }
+    evidence_parts = []
 
-        prompt = CRITIC_PROMPT.format(
-            question=question,
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
+
+        evidence_parts.append(
+            f"Document {index}\n"
+            f"{document_to_text(document)}"
+        )
+
+    return "\n\n".join(
+        evidence_parts
+    )
+
+
+# ============================================================
+# CRITIC
+# ============================================================
+
+def critic(state):
+
+    llm = get_llm()
+
+    evidence = build_evidence(
+        state
+    )
+
+    prompt = CRITIC_PROMPT.format(
+        question=state["question"],
+        evidence=evidence,
+    )
+
+    response = llm.invoke(prompt)
+
+    critique = clean_llm_output(
+        response.content
+    ).upper()
+
+    if critique not in {
+        "SUFFICIENT",
+        "INSUFFICIENT",
+    }:
+
+        critique = "INSUFFICIENT"
+
+    return {
+        "critique": critique,
+    }
+
+
+# ============================================================
+# REFORMULATE
+# ============================================================
+
+def reformulate(state):
+
+    llm = get_llm()
+
+    prompt = REFORMULATOR_PROMPT.format(
+        question=state["question"],
+        search_query=state.get(
+            "search_query",
+            state["question"],
+        ),
+    )
+
+    response = llm.invoke(prompt)
+
+    new_query = clean_llm_output(
+        response.content
+    )
+
+    if not new_query:
+
+        new_query = state["question"]
+
+    return {
+        "search_query": new_query,
+        "retrieval_attempts": (
+            state.get(
+                "retrieval_attempts",
+                0,
+            )
+            + 1
+        ),
+    }
+
+
+# ============================================================
+# SYNTHESIZER
+# ============================================================
+
+def synthesizer(state):
+
+    llm = get_llm()
+
+    evidence = build_evidence(
+        state
+    )
+
+    if state.get("route") == "web":
+
+        prompt = WEB_SYNTHESIS_PROMPT.format(
+            question=state["question"],
             evidence=evidence,
         )
 
-        response = self.llm.invoke(prompt)
-
-        critique = response.content.strip().upper()
-
-        if "SUFFICIENT" in critique:
-            critique = "SUFFICIENT"
-        else:
-            critique = "INSUFFICIENT"
-
-        return {
-            "critique": critique
-        }
-
-    def synthesizer(self, state: dict[str, Any]) -> dict[str, Any]:
-        """
-        Generate an answer using authorized retrieved evidence.
-        """
-
-        question = state["question"]
-        documents = state.get("documents", [])
-
-        evidence = "\n\n".join(
-            document.document.text
-            for document in documents
-        )
-
-        if not evidence:
-            return {
-                "answer": (
-                    "I could not find sufficient authorized information "
-                    "to answer this question."
-                )
-            }
+    else:
 
         prompt = SYNTHESIZER_PROMPT.format(
-            question=question,
+            question=state["question"],
             evidence=evidence,
         )
 
-        response = self.llm.invoke(prompt)
+    response = llm.invoke(prompt)
 
-        return {
-            "answer": response.content.strip()
-        }
+    answer = clean_llm_output(
+        response.content
+    )
 
-    def verifier(self, state: dict[str, Any]) -> dict[str, Any]:
-        """
-        Verify that the generated answer is supported by evidence.
-        """
+    # --------------------------------------------------------
+    # AUDIT EVENT
+    # --------------------------------------------------------
 
-        question = state["question"]
-        answer = state.get("answer", "")
-        documents = state.get("documents", [])
+    audit_logger.log_event(
+        event_type="answer_generated",
+        user_role=state["user_role"],
+        query=state["question"],
+        metadata={
+            "route": state.get("route"),
+            "answer_length": len(answer),
+        },
+    )
 
-        evidence = "\n\n".join(
-            document.document.text
-            for document in documents
+    return {
+        "answer": answer,
+    }
+
+
+# ============================================================
+# VERIFIER
+# ============================================================
+
+def verifier(state):
+
+    llm = get_llm()
+
+    evidence = build_evidence(
+        state
+    )
+
+    prompt = VERIFIER_PROMPT.format(
+        question=state["question"],
+        evidence=evidence,
+        answer=state.get(
+            "answer",
+            "",
+        ),
+    )
+
+    response = llm.invoke(prompt)
+
+    verification = clean_llm_output(
+        response.content
+    ).upper()
+
+    if verification not in {
+        "SUPPORTED",
+        "UNSUPPORTED",
+    }:
+
+        verification = "UNSUPPORTED"
+
+    # --------------------------------------------------------
+    # AUDIT EVENT
+    # --------------------------------------------------------
+
+    audit_logger.log_event(
+        event_type="verification",
+        user_role=state["user_role"],
+        query=state["question"],
+        metadata={
+            "route": state.get("route"),
+            "verification": verification,
+        },
+    )
+
+    return {
+        "verification": verification,
+    }
+
+
+# ============================================================
+# ABSTAIN
+# ============================================================
+
+def abstain(state):
+
+    route = state.get(
+        "route"
+    )
+
+    if (
+        route == "web"
+        and state.get("web_error")
+    ):
+
+        answer = (
+            "I cannot answer this using "
+            "web retrieval because the web "
+            "search service is unavailable: "
+            f"{state['web_error']}"
         )
 
-        if not answer or not evidence:
-            return {
-                "verification": "UNSUPPORTED"
-            }
+        reason = "web_error"
 
-        prompt = VERIFIER_PROMPT.format(
-            question=question,
-            evidence=evidence,
-            answer=answer,
+    elif (
+        route == "sql"
+        and state.get("sql_error")
+    ):
+
+        answer = (
+            "I cannot answer this using "
+            "the SQL source because the "
+            "database query failed: "
+            f"{state['sql_error']}"
         )
 
-        response = self.llm.invoke(prompt)
+        reason = "sql_error"
 
-        verification = response.content.strip().upper()
+    else:
 
-        if "SUPPORTED" in verification:
-            verification = "SUPPORTED"
-        else:
-            verification = "UNSUPPORTED"
+        answer = (
+            "I cannot provide a reliable "
+            "answer from the available "
+            "authorized evidence."
+        )
 
-        return {
-            "verification": verification
-        }
+        reason = (
+            "insufficient_or_unsupported_evidence"
+        )
 
-    def abstain(self, state: dict[str, Any]) -> dict[str, Any]:
-        """
-        Return a safe response when evidence is insufficient.
-        """
+    # --------------------------------------------------------
+    # AUDIT EVENT
+    # --------------------------------------------------------
 
-        return {
-            "answer": (
-                "I cannot provide a reliable answer because the "
-                "available authorized documents do not contain "
-                "sufficient supporting evidence."
-            )
-        }
+    audit_logger.log_event(
+        event_type="abstained",
+        user_role=state["user_role"],
+        query=state["question"],
+        metadata={
+            "route": route,
+            "reason": reason,
+        },
+    )
+
+    return {
+        "answer": answer,
+    }

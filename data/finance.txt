@@ -1,0 +1,17 @@
+Finance Department Report
+
+Document Classification: Confidential
+Department: Finance
+Authorized Roles: finance, admin
+
+Q1 2026 Financial Summary
+
+The company reported revenue of INR 48.5 crore in Q1 2026.
+Operating expenses were INR 31.2 crore.
+The operating profit was INR 17.3 crore.
+
+The finance department expects revenue to grow by approximately 8 percent
+in the next quarter based on current sales forecasts.
+
+This document contains confidential financial information and should only
+be accessible to authorized finance personnel and administrators.
