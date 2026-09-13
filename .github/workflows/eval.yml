@@ -1,0 +1,82 @@
+name: AuditAgent CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-and-evaluate:
+
+    runs-on: ubuntu-latest
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for Qdrant
+        run: |
+          python - <<'PY'
+          import time
+          import urllib.request
+
+          url = "http://localhost:6333/collections"
+
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      if response.status == 200:
+                          print("Qdrant is ready.")
+                          break
+              except Exception:
+                  pass
+
+              print(f"Waiting for Qdrant... attempt {attempt + 1}/30")
+              time.sleep(2)
+          else:
+              raise RuntimeError("Qdrant did not become ready.")
+          PY
+
+      - name: Seed SQLite database
+        run: |
+          python -m ingest.seed_sql
+
+      - name: Seed Qdrant
+        env:
+          QDRANT_URL: http://localhost:6333
+        run: |
+          python -m ingest.pipeline
+
+      - name: Run security tests
+        env:
+          QDRANT_URL: http://localhost:6333
+        run: |
+          pytest -q
+
+      - name: Run deterministic evaluation
+        env:
+          QDRANT_URL: http://localhost:6333
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: |
+          python -m evaluation.run_eval
